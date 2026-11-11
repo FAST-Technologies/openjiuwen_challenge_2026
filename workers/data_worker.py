@@ -1,48 +1,94 @@
-import asyncio
-import subprocess
-from pathlib import Path
-from .base_worker import BaseWorker
+import csv
 import logging
+import re
+
+from .base_worker import BaseWorker, extract_code, normalize_answer, run_py, split_sentences
 
 logger = logging.getLogger(__name__)
 
+P_RANGE = re.compile(r"how many units of product '([^']+)' were sold in months? (\d+)(?: through| to| and|-) (\d+)", re.I)
+P_ONE = re.compile(r"how many units of product '([^']+)' were sold in month (\d+)\b", re.I)
+TAIL = re.compile(r"^(use |work only|when you are done)", re.I)
+
+
+def _find_csv(workspace, instruction):
+    m = re.search(r"file ([\w.\-]+\.csv)", instruction)
+    if m and (workspace / m.group(1)).exists():
+        return workspace / m.group(1)
+    files = sorted(workspace.glob("*.csv"))
+    return files[0] if len(files) == 1 else None
+
+
+def _required_columns(instruction):
+    m = re.search(r"columns\s+([A-Za-z_][\w,]*)", instruction)
+    return [c for c in m.group(1).split(",") if c] if m else []
+
+
 class DataWorker(BaseWorker):
     async def solve(self, task: dict) -> bool:
+        self.clear_stale_answer(task)
         workspace = task["path"] / "workspace"
-        prompt = f"""Напиши Python-скрипт для решения задачи.
-Задача: {task['instruction']}
-Требования:
-1. Используй стандартный модуль `csv`.
-2. Читай файл строго так: open('sales.csv', 'r') (имя файла в кавычках!).
-3. Выведи ТОЛЬКО итоговое число или строку через print().
-4. Не пиши никаких объяснений, только сам код."""
-        
-        code, usage = await self.llm_client.call(prompt, model="qwen3.6-35b-a3b-noreason")
-        await self.budget_tracker.add_usage(usage["prompt_tokens"], usage["completion_tokens"])
-        
-        if not code: return False
-        code = code.replace("```python", "").replace("```", "").strip()
+        instr = task["instruction"]
+        check = task.get("check")
 
-        script_path = workspace / "solve_data.py"
-        try:
-            # 1. Записываем код в файл (никаких проблем с кавычками bash)
-            script_path.write_text(code, encoding="utf-8")
-            
-            # 2. Запускаем как обычный скрипт
-            result = await asyncio.to_thread(
-                subprocess.run, ["python3", "solve_data.py"], 
-                cwd=workspace, capture_output=True, text=True, timeout=20
-            )
-            
-            if result.returncode == 0 and result.stdout.strip():
-                self.save_answer(task["path"], result.stdout.strip())
-                return True
-            else:
-                logger.warning(f"Data failed. Stderr: {result.stderr}")
-        except Exception as e:
-            logger.warning(f"Data execution exception: {e}")
-        finally:
-            # 3. Чистим за собой временный файл
-            if script_path.exists():
-                script_path.unlink()
-        return False
+        csv_path = _find_csv(workspace, instr) if workspace.exists() else None
+        if csv_path is None:
+            self.trace(task, "precheck", False, "csv not found -> unsolvable")
+            return False
+        with open(csv_path, newline="", encoding="utf-8", errors="replace") as f:
+            rows = list(csv.DictReader(f))
+            header = rows and list(rows[0].keys()) or []
+        if not rows:
+            self.trace(task, "precheck", False, "empty csv -> unsolvable")
+            return False
+        missing = [c for c in _required_columns(instr) if c not in header]
+        if missing:
+            self.trace(task, "precheck", False, f"columns missing {missing} -> unsolvable")
+            return False
+
+        # 1) без LLM
+        res = self._deterministic(instr, rows)
+        if res is not None:
+            self.save_answer(task["path"], str(res))
+            self.trace(task, "deterministic", True)
+            return True
+
+        # 2) fallback: LLM пишет скрипт, запускаем без записи файлов
+        question = " ".join(s for s in split_sentences(instr) if not TAIL.match(s))
+        sample = "\n".join(",".join(r.values()) for r in rows[:3])
+        prompt = (f"Write a Python 3 script using only the stdlib `csv` module. Open the file with open('{csv_path.name}', newline='').\n"
+                  f"Columns: {','.join(header)}. Sample rows:\n{sample}\n"
+                  f"Task: {question}\nThe script must print ONLY the final answer. Return only code in one ```python block.")
+        text = await self.ask(task, prompt, "qwen3.6-35b-a3b-noreason", max_tokens=600)
+        rc, out, err = await run_py(extract_code(text), workspace, timeout=20)
+        ans = normalize_answer(out, check) if rc == 0 else None
+        if ans is None:
+            logger.warning(f"data fallback failed rc={rc} err={err[:200]}")
+            self.trace(task, "llm", False, err)
+            return False
+        self.save_answer(task["path"], ans)
+        self.trace(task, "llm", True)
+        return True
+
+    @staticmethod
+    def _deterministic(instr: str, rows: list[dict]) -> int | None:
+        m = P_RANGE.search(instr)
+        if m:
+            product, lo, hi = m.group(1).lower(), int(m.group(2)), int(m.group(3))
+        else:
+            m = P_ONE.search(instr)
+            if not m:
+                return None
+            product, lo, hi = m.group(1).lower(), int(m.group(2)), int(m.group(2))
+        total, bad = 0, 0
+        for r in rows:
+            try:
+                month, units = int(r["month"]), int(r["units"])
+            except (KeyError, ValueError, TypeError):
+                bad += 1
+                continue
+            if (r.get("product") or "").strip().lower() == product and lo <= month <= hi:
+                total += units
+        if bad:
+            logger.warning(f"data: пропущено {bad} некорректных строк")
+        return total
