@@ -1,0 +1,13 @@
+.env
+.venv
+token.txt
+team.json
+local_tasks
+task-dir
+theory_files
+answer.txt
+**/__pycache__
+*.pyc
+.git
+README.md
+collect_harness_report.py
