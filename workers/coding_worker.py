@@ -55,6 +55,27 @@ def _variants(node):
     if isinstance(node, ast.Constant) and type(node.value) is int:
         for d in (1, -1):
             v.append((1, lambda n, d=d: setattr(n, "value", n.value + d)))
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "sorted"
+        and len(node.args) == 1
+        and not node.keywords
+    ):
+        def sorted_to_reversed_list(n):
+            original_arg = n.args[0]
+
+            reversed_call = ast.Call(
+                func=ast.Name(id="reversed", ctx=ast.Load()),
+                args=[original_arg],
+                keywords=[],
+            )
+
+            n.func = ast.Name(id="list", ctx=ast.Load())
+            n.args = [reversed_call]
+            n.keywords = []
+
+        v.append((0, sorted_to_reversed_list))
     return v
 
 
@@ -113,36 +134,103 @@ class CodingWorker(BaseWorker):
         return False
 
     # ------------------------------------------------------------
-    def _mutation_repair(self, ws: Path, lib: str, test: str, orig: str, score0: int,
-                         budget_s: float = 45.0, rounds: int = 5):
+    
+    def _mutation_repair(
+        self,
+        ws: Path,
+        lib: str,
+        test: str,
+        orig: str,
+        score0: int,
+        budget_s: float = 45.0,
+        rounds: int = 5,
+    ):
+        logger.info(
+            "Mutation repair started: lib=%s test=%s initial_score=%s",
+            lib, test, score0,
+        )
+
         try:
             tree = ast.parse(orig)
         except SyntaxError:
+            logger.exception("Original source has SyntaxError")
             return None
+
         tmp = Path(tempfile.mkdtemp(prefix="mut_"))
+
         try:
-            for f in ws.iterdir():
-                if f.is_file():
-                    shutil.copy(f, tmp / f.name)
+            shutil.copytree(ws, tmp, dirs_exist_ok=True)
+
             deadline = time.monotonic() + budget_s
-            cur_tree, cur_src, cur_score = tree, orig, score0
-            for _ in range(rounds):
+            cur_tree = tree
+            cur_src = orig
+            cur_score = score0
+
+            for round_no in range(1, rounds + 1):
                 best = None
-                for prio, idx, src in mutants(cur_tree):
+                checked = 0
+                improvements = 0
+                best_seen = cur_score
+
+                candidates = list(mutants(cur_tree))
+                logger.info(
+                    "Mutation round %d: candidates=%d current_score=%s",
+                    round_no, len(candidates), cur_score,
+                )
+
+                for prio, idx, src in candidates:
                     if time.monotonic() > deadline:
+                        logger.warning(
+                            "Mutation deadline reached in round %d",
+                            round_no,
+                        )
                         break
+
+                    checked += 1
+
                     (tmp / lib).write_text(src, encoding="utf-8")
-                    rc, score, _ = run_tests(tmp, test, timeout=8)
-                    key = (score, prio, idx)
-                    if score < cur_score and (best is None or key < best[0]):
-                        best = (key, src, score)
+                    rc, score, output = run_tests(tmp, test, timeout=8)
+
+                    best_seen = min(best_seen, score)
+
+                    if score < cur_score:
+                        improvements += 1
+                        key = (score, prio, idx)
+
+                        if best is None or key < best[0]:
+                            best = (key, src, score)
+
+                    if score == 0:
+                        logger.info(
+                            "Mutation repair succeeded: round=%d "
+                            "candidate=%d checked=%d",
+                            round_no, idx, checked,
+                        )
+                        return src
+
+                logger.info(
+                    "Mutation round %d finished: checked=%d "
+                    "improvements=%d best_seen=%s",
+                    round_no, checked, improvements, best_seen,
+                )
+
                 if best is None:
+                    logger.warning(
+                        "No improving mutation in round %d; "
+                        "current_score=%s best_seen=%s",
+                        round_no, cur_score, best_seen,
+                    )
                     return None
+
                 _, cur_src, cur_score = best
-                if cur_score == 0:
-                    return cur_src
                 cur_tree = ast.parse(cur_src)
+
+            logger.warning(
+                "Mutation repair exhausted rounds=%d final_score=%s",
+                rounds, cur_score,
+            )
             return None
+
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
