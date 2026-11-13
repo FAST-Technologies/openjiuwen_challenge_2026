@@ -1,0 +1,8 @@
+{
+  "team_name": "GradientAI",
+  "participants": [
+    {"full_name":"Ямщиков Владимир Сергеевич","email":"","telegram":"","phone":"","university":"Новосибирский государственный университет","city":"Новосибирск","citizenship":"Россия"},
+    {"full_name":"Орловский Глеб Геннадьевич","email":"","telegram":"","phone":"","university":"Новосибирский государственный университет","city":"Новосибирск","citizenship":"Россия"}
+  ],
+  "consent": {"accepted": true, "text_version": "nsu-privacy-registration-v1"}
+}

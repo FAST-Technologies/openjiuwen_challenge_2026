@@ -1,7 +1,7 @@
 *.pyc
 local_tasks/
 .DS_Store
-team.json
+team_2.json
 task-dir/
 
 # Byte-compiled / optimized / DLL files
