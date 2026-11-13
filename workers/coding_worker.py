@@ -1,3 +1,4 @@
+# workers/coding_worker.py
 import ast
 import asyncio
 import copy
@@ -93,6 +94,26 @@ def mutants(tree):
 
 
 class CodingWorker(BaseWorker):
+    @staticmethod
+    def _names(instr: str) -> tuple[str, str]:
+        m = re.search(r"bugs in ([\w.]+\.py)", instr)
+        lib = m.group(1) if m else "mylib.py"
+        m = re.search(r"python3 ([\w.]+\.py)", instr)
+        return lib, (m.group(1) if m else "test_mylib.py")
+
+    def estimate(self, task: dict) -> tuple[str, float]:
+        ws = task["path"] / "workspace"
+        lib, test = self._names(task["instruction"])
+        if not (ws / lib).exists() or not (ws / test).exists():
+            return "unsolvable", 0.0
+        try:
+            n_lib = len((ws / lib).read_text(encoding="utf-8", errors="replace"))
+            n_test = len((ws / test).read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            return "unsolvable", 0.0
+        # верхняя оценка для LLM-пути: вход (lib+test)/10, выход ≈ файл целиком + запас на рассуждения
+        return "llm", 150 + (n_lib + n_test) / 35 + n_lib / 3.5 * 1.3
+    
     async def solve(self, task: dict) -> bool:
         self.clear_stale_answer(task)
         ws = task["path"] / "workspace"
@@ -131,6 +152,16 @@ class CodingWorker(BaseWorker):
             return True
         lib_path.write_text(orig, encoding="utf-8")
         self.trace(task, "llm", False, "not fixed")
+        
+        # 3) эскалация: ReAct-агент openJiuwen; результат проверяем сами, а не верим агенту
+        await self.escalate(task, f"Run `{test}` with run_file; some tests fail. Fix the bugs in {lib} "
+                                  f"(write the COMPLETE file with write_file, never edit tests) until all tests pass. Reply DONE.")
+        if (await asyncio.to_thread(run_tests, ws, test))[0] == 0:
+            self.save_answer(task["path"], "DONE")
+            self.trace(task, "agent", True)
+            return True
+        lib_path.write_text(orig, encoding="utf-8")
+        self.trace(task, "llm+agent", False, "not fixed")
         return False
 
     # ------------------------------------------------------------

@@ -50,12 +50,27 @@ async def run_py(code: str, cwd: Path, timeout: float = 20) -> tuple[int, str, s
             return 124, "", "timeout"
     return await asyncio.to_thread(_run)
 
+
 class BaseWorker:
     def __init__(self, llm_client, budget_tracker):
         self.llm_client = llm_client
         self.budget_tracker = budget_tracker
+        self.escalator = None  # openJiuwen ReAct-агент (escalation.Escalator), выставляется в run_agent
         self._tokens: dict[str, float] = {}
 
+    def estimate(self, task: dict) -> tuple[str, float]:
+        """Оценка до запуска, без обращения к LLM: ('free'|'llm'|'unsolvable', ожидаемые токены)."""
+        return "llm", 1000.0
+
+    async def escalate(self, task: dict, goal: str) -> str | None:
+        """Последняя попытка: ReAct-агент openJiuwen с инструментами. Расход уже учтён в BudgetTracker."""
+        if self.escalator is None:
+            return None
+        answer, spent = await self.escalator.run(task, goal)
+        self._tokens[task["task_id"]] = self._tokens.get(task["task_id"], 0.0) + spent
+        return answer
+
+    # ---------- файлы ----------
     def save_answer(self, task_path: Path, answer: str):
         answer_file = task_path / "answer.txt"
         with open(answer_file, "w", encoding="utf-8") as f:
@@ -70,7 +85,7 @@ class BaseWorker:
         except OSError as e:
             logger.warning(f"Не удалось удалить старый answer.txt: {e}")
 
-
+    # ---------- LLM ----------
     async def ask(self, task: dict, prompt: str, model: str, max_tokens: int,
                   system: str | None = None) -> str:
         text, usage = await self.llm_client.call(prompt, model=model,
@@ -80,10 +95,12 @@ class BaseWorker:
         self._tokens[task["task_id"]] = self._tokens.get(task["task_id"], 0.0) + cost
         return text or ""
 
+    # ---------- траектории (для README) ----------
     def trace(self, task: dict, method: str, ok: bool, note: str = ""):
         rec = {"ts": round(time.time(), 1), "task_id": task["task_id"],
                "type": task.get("task_type"), "reward": task.get("reward"),
                "method": method, "ok": ok, "tokens": round(self._tokens.get(task["task_id"], 0.0), 1),
+               "est": round(float(task.get("estimated_cost", 0.0)), 1), "plan": task.get("plan"),
                "note": note[:300]}
         logger.info(f"TRACE {json.dumps(rec, ensure_ascii=False)}")
         try:

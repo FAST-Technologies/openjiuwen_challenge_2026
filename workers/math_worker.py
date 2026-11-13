@@ -1,3 +1,4 @@
+# workers/math_worker.py
 import logging
 import re
 
@@ -53,6 +54,14 @@ def solve_deterministic(instruction: str) -> int | None:
 
 
 class MathWorker(BaseWorker):
+    def estimate(self, task: dict) -> tuple[str, float]:
+        try:
+            if solve_deterministic(task["instruction"]) is not None:
+                return "free", 0.0
+        except Exception:
+            pass
+        return "llm", 70 + len(task["instruction"]) / 35
+
     async def solve(self, task: dict) -> bool:
         self.clear_stale_answer(task)
         check = task.get("check") or "exact_int"
@@ -80,8 +89,14 @@ class MathWorker(BaseWorker):
         ans = normalize_answer(out, check) if rc == 0 else None
         if ans is None:
             logger.warning(f"math fallback failed: rc={rc} err={err[:200]}")
-            self.trace(task, "llm", False, err)
-            return False
+            reply = await self.escalate(task, problem + " Use run_python to compute it. Reply with ONLY the final integer.")
+            ans = normalize_answer(reply, check) if reply else None
+            if ans is None:
+                self.trace(task, "llm+agent", False, err)
+                return False
+            self.save_answer(task["path"], ans)
+            self.trace(task, "agent", True)
+            return True
         self.save_answer(task["path"], ans)
         self.trace(task, "llm", True)
         return True

@@ -1,3 +1,4 @@
+# workers/search_worker.py
 import logging
 import re
 from pathlib import Path
@@ -119,6 +120,20 @@ def resolve(kb: KB, q: str):
 
 
 class SearchWorker(BaseWorker):
+    def estimate(self, task: dict) -> tuple[str, float]:
+        kb_dir = task["path"] / "workspace" / "kb"
+        if not kb_dir.exists():
+            return "unsolvable", 0.0
+        kb = KB(kb_dir)
+        q = " ".join(s for s in split_sentences(task["instruction"]) if s.endswith("?")) or task["instruction"]
+        ans, status = resolve(kb, q)
+        if status == "ok":
+            return "free", 0.0
+        if status == "unknown_entity":
+            return "unsolvable", 0.0
+        ctx = kb.context([t for t, _, _ in kb.mentions(q)])
+        return "llm", 15 + (len(ctx) + len(q) + 200) / 35
+
     async def solve(self, task: dict) -> bool:
         self.clear_stale_answer(task)
         kb_dir = task["path"] / "workspace" / "kb"

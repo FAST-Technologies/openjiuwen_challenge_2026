@@ -1,3 +1,4 @@
+# workers/data_worker.py
 import csv
 import logging
 import re
@@ -23,37 +24,75 @@ def _required_columns(instruction):
     m = re.search(r"columns\s+([A-Za-z_][\w,]*)", instruction)
     return [c for c in m.group(1).split(",") if c] if m else []
 
+def deterministic_answer(instr: str, rows: list[dict]) -> int | None:
+    m = P_RANGE.search(instr)
+    if m:
+        product, lo, hi = m.group(1).lower(), int(m.group(2)), int(m.group(3))
+    else:
+        m = P_ONE.search(instr)
+        if not m:
+            return None
+        product, lo, hi = m.group(1).lower(), int(m.group(2)), int(m.group(2))
+    total, bad = 0, 0
+    for r in rows:
+        try:
+            month, units = int(r["month"]), int(r["units"])
+        except (KeyError, ValueError, TypeError):
+            bad += 1
+            continue
+        if (r.get("product") or "").strip().lower() == product and lo <= month <= hi:
+            total += units
+    if bad:
+        logger.warning(f"data: пропущено {bad} некорректных строк")
+    return total
+
 
 class DataWorker(BaseWorker):
+    def _inspect(self, task: dict):
+        """-> ('unsolvable', причина) | ('ok', csv_path, header, rows)."""
+        workspace = task["path"] / "workspace"
+        csv_path = _find_csv(workspace, task["instruction"]) if workspace.exists() else None
+        if csv_path is None:
+            return "unsolvable", "csv not found"
+        try:
+            with open(csv_path, newline="", encoding="utf-8", errors="replace") as f:
+                rows = list(csv.DictReader(f))
+        except Exception as e:
+            return "unsolvable", f"csv unreadable: {e}"
+        if not rows:
+            return "unsolvable", "empty csv"
+        header = list(rows[0].keys())
+        missing = [c for c in _required_columns(task["instruction"]) if c not in header]
+        if missing:
+            return "unsolvable", f"columns missing {missing}"
+        return "ok", csv_path, header, rows
+
+    def estimate(self, task: dict) -> tuple[str, float]:
+        info = self._inspect(task)
+        if info[0] != "ok":
+            return "unsolvable", 0.0
+        if deterministic_answer(task["instruction"], info[3]) is not None:
+            return "free", 0.0
+        return "llm", 120 + len(task["instruction"]) / 35 + len(",".join(info[2])) / 35
+
     async def solve(self, task: dict) -> bool:
         self.clear_stale_answer(task)
-        workspace = task["path"] / "workspace"
-        instr = task["instruction"]
-        check = task.get("check")
-
-        csv_path = _find_csv(workspace, instr) if workspace.exists() else None
-        if csv_path is None:
-            self.trace(task, "precheck", False, "csv not found -> unsolvable")
+        instr, check = task["instruction"], task.get("check")
+        info = self._inspect(task)
+        if info[0] != "ok":
+            self.trace(task, "precheck", False, f"{info[1]} -> unsolvable")
             return False
-        with open(csv_path, newline="", encoding="utf-8", errors="replace") as f:
-            rows = list(csv.DictReader(f))
-            header = rows and list(rows[0].keys()) or []
-        if not rows:
-            self.trace(task, "precheck", False, "empty csv -> unsolvable")
-            return False
-        missing = [c for c in _required_columns(instr) if c not in header]
-        if missing:
-            self.trace(task, "precheck", False, f"columns missing {missing} -> unsolvable")
-            return False
+        _, csv_path, header, rows = info
 
         # 1) без LLM
-        res = self._deterministic(instr, rows)
+        res = deterministic_answer(instr, rows)
         if res is not None:
             self.save_answer(task["path"], str(res))
             self.trace(task, "deterministic", True)
             return True
 
         # 2) fallback: LLM пишет скрипт, запускаем без записи файлов
+        workspace = task["path"] / "workspace"
         question = " ".join(s for s in split_sentences(instr) if not TAIL.match(s))
         sample = "\n".join(",".join(r.values()) for r in rows[:3])
         prompt = (f"Write a Python 3 script using only the stdlib `csv` module. Open the file with open('{csv_path.name}', newline='').\n"
@@ -64,31 +103,15 @@ class DataWorker(BaseWorker):
         ans = normalize_answer(out, check) if rc == 0 else None
         if ans is None:
             logger.warning(f"data fallback failed rc={rc} err={err[:200]}")
-            self.trace(task, "llm", False, err)
-            return False
+            reply = await self.escalate(task, f"File {csv_path.name} has columns {','.join(header)}. {question} "
+                                              "Use run_python to compute it. Reply with ONLY the final answer.")
+            ans = normalize_answer(reply, check) if reply else None
+            if ans is None:
+                self.trace(task, "llm+agent", False, err)
+                return False
+            self.save_answer(task["path"], ans)
+            self.trace(task, "agent", True)
+            return True
         self.save_answer(task["path"], ans)
         self.trace(task, "llm", True)
         return True
-
-    @staticmethod
-    def _deterministic(instr: str, rows: list[dict]) -> int | None:
-        m = P_RANGE.search(instr)
-        if m:
-            product, lo, hi = m.group(1).lower(), int(m.group(2)), int(m.group(3))
-        else:
-            m = P_ONE.search(instr)
-            if not m:
-                return None
-            product, lo, hi = m.group(1).lower(), int(m.group(2)), int(m.group(2))
-        total, bad = 0, 0
-        for r in rows:
-            try:
-                month, units = int(r["month"]), int(r["units"])
-            except (KeyError, ValueError, TypeError):
-                bad += 1
-                continue
-            if (r.get("product") or "").strip().lower() == product and lo <= month <= hi:
-                total += units
-        if bad:
-            logger.warning(f"data: пропущено {bad} некорректных строк")
-        return total
