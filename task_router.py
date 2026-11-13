@@ -5,7 +5,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-MIN_COST = 10.0  # пол для знаменателя ROI, чтобы бесплатные задачи не давали бесконечность
+MIN_COST = 10.0
 
 
 class TaskRouter:
@@ -47,7 +47,7 @@ class TaskRouter:
                 continue
             try:
                 t["plan"], t["estimated_cost"] = worker.estimate(t)
-            except Exception as e:  # оценка не должна ронять запуск
+            except Exception as e:
                 logger.warning(f"{t['task_id']}: ошибка оценки ({type(e).__name__}: {e}) — считаем как llm")
                 t["plan"], t["estimated_cost"] = "llm", 1000.0
         solvable = [t for t in tasks if t["plan"] != "unsolvable"]

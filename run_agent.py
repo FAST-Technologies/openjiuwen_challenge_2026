@@ -11,7 +11,7 @@ from oj_setup import configure_openjiuwen_logging
 
 configure_openjiuwen_logging(os.environ.get("OJ_LOG_LEVEL", "WARNING"))
 
-import openjiuwen  # noqa: E402  харнесс построен на openJiuwen (llm_client.py, escalation.py)
+import openjiuwen  # noqa: E402
 
 from budget_tracker import BudgetTracker  # noqa: E402
 from escalation import Escalator  # noqa: E402
@@ -48,9 +48,9 @@ def write_summary(record: dict):
     except OSError:
         pass
 
-
 async def process_task(task, workers_map, tracker, deadline):
     tid = task["task_id"]
+
     if task["plan"] == "unsolvable":
         stale = task["path"] / "answer.txt"
         if stale.exists():
@@ -58,21 +58,53 @@ async def process_task(task, workers_map, tracker, deadline):
         logger.info(f"⛔ {tid}: невыполнима по данным задачи, пропуск (0 токенов)")
         write_summary({"task_id": tid, "solved": False, "reason": "unsolvable"})
         return
+
     worker = workers_map[task["task_type"]]
-    if not await tracker.can_afford(task["estimated_cost"]):
-        logger.warning(f"⏭️ {tid}: недостаточно бюджета (нужно ~{task['estimated_cost']:.0f})")
-        return
+
     timeout = min(TASK_TIMEOUT, deadline - time.monotonic())
     if timeout <= 0:
         return
-    logger.info(f"🚀 {tid} ({task['task_type']}, reward={task['reward']:g}, plan={task['plan']}, est={task['estimated_cost']:.0f})")
+
+    estimated_cost = float(task["estimated_cost"])
+
+    reservation_id = await tracker.try_reserve(estimated_cost)
+
+    if reservation_id is None:
+        logger.warning(
+            f"⏭️ {tid}: недостаточно бюджета "
+            f"(нужно ~{estimated_cost:.0f})"
+        )
+        write_summary({
+            "task_id": tid,
+            "solved": False,
+            "reason": "insufficient_budget",
+        })
+        return
+
+    logger.info(
+        f"🚀 {tid} ({task['task_type']}, reward={task['reward']:g}, "
+        f"plan={task['plan']}, est={estimated_cost:.0f})"
+    )
+
     try:
-        ok = await asyncio.wait_for(worker.solve(task), timeout=timeout)
-    except Exception as e:  # одна задача не должна ронять остальные
-        logger.warning(f"💥 {tid}: {type(e).__name__}: {e}")
-        ok = False
+        with tracker.use_reservation(reservation_id):
+            try:
+                ok = await asyncio.wait_for(
+                    worker.solve(task),
+                    timeout=timeout,
+                )
+            except Exception as e:
+                logger.warning(f"💥 {tid}: {type(e).__name__}: {e}")
+                ok = False
+
+    finally:
+        released = await tracker.release_reservation(reservation_id)
+        logger.info(f"🔓 {tid}: освобождён резерв {released:.1f}")
+
     logger.info(f"{'✅' if ok else '⏭️'} {tid}: {'решена' if ok else 'без ответа'}")
+
     write_summary({"task_id": tid, "solved": bool(ok)})
+
 
 
 async def consumer(queue, workers_map, tracker, deadline):

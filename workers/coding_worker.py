@@ -38,6 +38,54 @@ def run_tests(workdir: Path, test_file: str, timeout: float = 15):
     return p.returncode, n, out
 
 
+def run_semantic_checks(workdir: Path, lib: str, timeout: float = 5):
+    """Проверяет базовые свойства известных функций независимо от task tests."""
+    script = r'''
+import importlib.util
+import sys
+
+path = sys.argv[1]
+sys.path.insert(0, str(__import__("os").path.dirname(path)))
+
+spec = importlib.util.spec_from_file_location("candidate_module", path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+if hasattr(module, "count_even"):
+    fn = module.count_even
+    cases = [
+        ([2, 4, 6], 3),
+        ([1, 3, 5], 0),
+        ([], 0),
+        ([1, 2, 3, 4], 2),
+    ]
+
+    for values, expected in cases:
+        actual = fn(values)
+        if actual != expected:
+            print(
+                f"count_even failed: {values} -> "
+                f"{actual}, expected {expected}"
+            )
+            sys.exit(1)
+
+sys.exit(0)
+'''
+    try:
+        workdir = workdir.resolve()
+        lib_path = (workdir / lib).resolve()
+
+        p = subprocess.run(
+            [sys.executable, "-B", "-c", script, str(lib_path)],
+            cwd=str(workdir),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return p.returncode == 0, p.stdout + p.stderr
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return False, str(e)
+
 def _variants(node):
     """[(приоритет, функция-мутатор)] для узла AST."""
     v = []
@@ -111,7 +159,6 @@ class CodingWorker(BaseWorker):
             n_test = len((ws / test).read_text(encoding="utf-8", errors="replace"))
         except OSError:
             return "unsolvable", 0.0
-        # верхняя оценка для LLM-пути: вход (lib+test)/10, выход ≈ файл целиком + запас на рассуждения
         return "llm", 150 + (n_lib + n_test) / 35 + n_lib / 3.5 * 1.3
     
     async def solve(self, task: dict) -> bool:
@@ -130,7 +177,11 @@ class CodingWorker(BaseWorker):
         orig = lib_path.read_text(encoding="utf-8")
         test_src = test_path.read_text(encoding="utf-8")
         rc, n0, out0 = await asyncio.to_thread(run_tests, ws, test)
-        if rc == 0:
+        semantic_ok, semantic_out = await asyncio.to_thread(
+            run_semantic_checks, ws, lib
+        )
+
+        if rc == 0 and semantic_ok:
             self.save_answer(task["path"], "DONE")
             self.trace(task, "already-passing", True)
             return True
@@ -139,10 +190,17 @@ class CodingWorker(BaseWorker):
         fixed = await asyncio.to_thread(self._mutation_repair, ws, lib, test, orig, n0)
         if fixed is not None:
             lib_path.write_text(fixed, encoding="utf-8")
-            if (await asyncio.to_thread(run_tests, ws, test))[0] == 0:
+            test_rc, _, _ = await asyncio.to_thread(run_tests, ws, test)
+            semantic_ok, semantic_out = await asyncio.to_thread(
+                run_semantic_checks, ws, lib
+            )
+
+            if test_rc == 0 and semantic_ok:
                 self.save_answer(task["path"], "DONE")
                 self.trace(task, "mutation", True)
                 return True
+
+            logger.warning("Mutation rejected by validation: %s", semantic_out)
             lib_path.write_text(orig, encoding="utf-8")
 
         # 2) LLM
@@ -153,18 +211,22 @@ class CodingWorker(BaseWorker):
         lib_path.write_text(orig, encoding="utf-8")
         self.trace(task, "llm", False, "not fixed")
         
-        # 3) эскалация: ReAct-агент openJiuwen; результат проверяем сами, а не верим агенту
+        # 3) эскалация: ReAct-агент openJiuwen
         await self.escalate(task, f"Run `{test}` with run_file; some tests fail. Fix the bugs in {lib} "
                                   f"(write the COMPLETE file with write_file, never edit tests) until all tests pass. Reply DONE.")
-        if (await asyncio.to_thread(run_tests, ws, test))[0] == 0:
+        test_rc, _, _ = await asyncio.to_thread(run_tests, ws, test)
+        semantic_ok, semantic_out = await asyncio.to_thread(
+            run_semantic_checks, ws, lib
+        )
+
+        if test_rc == 0 and semantic_ok:
             self.save_answer(task["path"], "DONE")
             self.trace(task, "agent", True)
             return True
+
         lib_path.write_text(orig, encoding="utf-8")
         self.trace(task, "llm+agent", False, "not fixed")
         return False
-
-    # ------------------------------------------------------------
     
     def _mutation_repair(
         self,
@@ -289,7 +351,13 @@ class CodingWorker(BaseWorker):
                 continue
             (ws / lib).write_text(code, encoding="utf-8")
             rc, _, out = await asyncio.to_thread(run_tests, ws, test)
-            if rc == 0:
+            semantic_ok, semantic_out = await asyncio.to_thread(
+                run_semantic_checks, ws, lib
+            )
+
+            if rc == 0 and semantic_ok:
                 return True
-            feedback, current = out[-1500:], code
+
+            feedback = (out + "\nSemantic validation failed:\n" + semantic_out)[-1500:]
+            current = code
         return False

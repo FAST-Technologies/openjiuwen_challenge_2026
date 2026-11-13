@@ -55,7 +55,7 @@ class BaseWorker:
     def __init__(self, llm_client, budget_tracker):
         self.llm_client = llm_client
         self.budget_tracker = budget_tracker
-        self.escalator = None  # openJiuwen ReAct-агент (escalation.Escalator), выставляется в run_agent
+        self.escalator = None  # openJiuwen ReAct-агент (escalation.Escalator)
         self._tokens: dict[str, float] = {}
 
     def estimate(self, task: dict) -> tuple[str, float]:
@@ -70,7 +70,6 @@ class BaseWorker:
         self._tokens[task["task_id"]] = self._tokens.get(task["task_id"], 0.0) + spent
         return answer
 
-    # ---------- файлы ----------
     def save_answer(self, task_path: Path, answer: str):
         answer_file = task_path / "answer.txt"
         with open(answer_file, "w", encoding="utf-8") as f:
@@ -85,7 +84,6 @@ class BaseWorker:
         except OSError as e:
             logger.warning(f"Не удалось удалить старый answer.txt: {e}")
 
-    # ---------- LLM ----------
     async def ask(self, task: dict, prompt: str, model: str, max_tokens: int,
                   system: str | None = None) -> str:
         text, usage = await self.llm_client.call(prompt, model=model,
@@ -95,7 +93,6 @@ class BaseWorker:
         self._tokens[task["task_id"]] = self._tokens.get(task["task_id"], 0.0) + cost
         return text or ""
 
-    # ---------- траектории (для README) ----------
     def trace(self, task: dict, method: str, ok: bool, note: str = ""):
         rec = {"ts": round(time.time(), 1), "task_id": task["task_id"],
                "type": task.get("task_type"), "reward": task.get("reward"),

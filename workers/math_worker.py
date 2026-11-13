@@ -9,7 +9,6 @@ logger = logging.getLogger(__name__)
 IGNORE = re.compile(r"^(how many|compute|use |work only|when you are done|write )", re.I)
 START = re.compile(r"starts? with (\d+)\b", re.I)
 
-# (regex, функция (n, match) -> новое n); порядок важен
 STEPS = [
     (re.compile(r"split equally into (\d+) \w+ and it keeps one share.*rounded up", re.I),
      lambda n, m: -(-n // int(m[1]))),

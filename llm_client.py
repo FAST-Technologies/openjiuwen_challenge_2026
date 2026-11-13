@@ -24,7 +24,6 @@ def usage_from_message(msg, prompt_chars: int = 0, text: str = "") -> dict:
                          int(u.total_tokens or 0) - prompt,
                          int(u.reasoning_tokens or 0))
         return {"prompt_tokens": prompt, "completion_tokens": max(completion, 0)}
-    # консервативная оценка (≈3.5 символа на токен)
     return {"prompt_tokens": int(prompt_chars / 3.5), "completion_tokens": int(len(text) / 3.5) + 1}
 
 
@@ -81,7 +80,7 @@ class LLMClient:
                                                           timeout=self.timeout)
                     text = str(getattr(msg, "content", "") or "").strip()
                     return text, usage_from_message(msg, chars, text)
-                except Exception as e:  # ошибки openJiuwen/сети/429
+                except Exception as e:
                     delay = min(2 ** attempt * 2, 20) + random.random()
                     logger.warning(f"LLM error ({model}, попытка {attempt + 1}/{max_retries}): "
                                    f"{type(e).__name__}: {str(e)[:200]}; повтор через {delay:.1f}с")

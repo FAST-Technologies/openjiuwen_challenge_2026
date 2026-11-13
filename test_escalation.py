@@ -60,7 +60,6 @@ async def main():
     finally:
         await srv.stop()
 
-    # 3) потолок на задачу: после превышения cap вызовы прекращаются, наружу исключение не летит
     srv = await FakeLLM([{"tool": "list_dir", "args": {"path": "."}}] * 10, reasoning_tokens=400).start()
     try:
         tr = Tracker()
@@ -71,7 +70,7 @@ async def main():
     finally:
         await srv.stop()
 
-    # 4) мало бюджета -> эскалация не стартует
+    # 3) мало бюджета -> эскалация не стартует
     tr = Tracker(1000.0); tr.spent = 900.0
     esc = Escalator(LLMClient("k", "http://127.0.0.1:1/v1"), tr)
     ans, spent = await esc.run(task, "x")

@@ -50,7 +50,7 @@ class KB:
 
     def context(self, titles: list[str], limit: int = 6000) -> str:
         seen, order, frontier = set(), [], list(titles)
-        for _ in range(3):  # сами сущности + ссылки на 2 шага
+        for _ in range(3):
             nxt = []
             for t in frontier:
                 lst = self.entities.get(t.lower(), [])
@@ -108,7 +108,6 @@ def resolve(kb: KB, q: str):
         if val is None:
             return None, "missing"
         if i == len(order) - 1:
-            # итог — ссылка на другую сущность, а вопрос не «кто/какая компания» -> не уверены, отдаём LLM
             if kb.get(val) is not None and not re.search(
                     r"\b(who|whom|which (company|employer|person)|what (company|employer))\b", ql):
                 return None, "unparsed"
@@ -152,7 +151,7 @@ class SearchWorker(BaseWorker):
             self.trace(task, "precheck", False, "entity from question not in kb -> unsolvable")
             return False
 
-        # fallback: в промпт идут только релевантные файлы
+        # fallback
         titles = [t for t, _, _ in kb.mentions(q)]
         prompt = (f"Knowledge base files:\n{kb.context(titles)}\n\nQuestion: {q}\n"
                   "Reply with ONLY the answer value exactly as written in the files. "

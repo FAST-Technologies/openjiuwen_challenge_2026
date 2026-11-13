@@ -9,7 +9,7 @@ class FakeLLM:
     """script: список ответов. str -> текст; dict {"tool": name, "args": {...}} -> вызов инструмента."""
 
     def __init__(self, script=(), reasoning_tokens=0, responder=None):
-        self.responder = responder  # callable(body) -> item; приоритетнее script
+        self.responder = responder
         self.script = list(script)
         self.requests = []
         self.reasoning_tokens = reasoning_tokens
